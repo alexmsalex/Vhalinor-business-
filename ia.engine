@@ -1,0 +1,79 @@
+"""Motor de sinais explicáveis para simulação; não envia ordens reais."""
+from __future__ import annotations
+import math
+import pandas as pd
+
+def _close_series(data):
+    close = data["Close"] if isinstance(data, pd.DataFrame) else data
+    close = pd.to_numeric(close, errors="coerce").dropna().astype(float)
+    return close[close > 0]
+
+def analyze_asset(data, risk_tolerance="moderate"):
+    close = _close_series(data)
+    if len(close) < 60:
+        return {"ticker": None, "decision": "INSUFFICIENT_DATA", "score": 0,
+                "confidence": 0.0, "rsi": None, "sma20": None, "sma50": None,
+                "momentum_20d_pct": None, "annualized_volatility_pct": None,
+                "max_drawdown_pct": None,
+                "reasons": ["São necessários pelo menos 60 preços válidos."],
+                "risk_flags": ["Histórico insuficiente para avaliar tendência e risco."]}
+    returns = close.pct_change().dropna()
+    delta = close.diff()
+    avg_gain = delta.clip(lower=0).rolling(14).mean()
+    avg_loss = -delta.clip(upper=0).rolling(14).mean()
+    rs = avg_gain / avg_loss.replace(0, float("nan"))
+    rsi_s = 100 - 100 / (1 + rs)
+    rsi = float(rsi_s.iloc[-1]) if pd.notna(rsi_s.iloc[-1]) else (100.0 if avg_loss.iloc[-1] == 0 else 50.0)
+    last = float(close.iloc[-1])
+    sma20, sma50 = float(close.rolling(20).mean().iloc[-1]), float(close.rolling(50).mean().iloc[-1])
+    momentum = float((last / float(close.iloc[-21]) - 1) * 100)
+    vol = float(returns.tail(60).std() * math.sqrt(252) * 100) if len(returns) > 1 else 0.0
+    max_dd = float((close / close.cummax() - 1).min() * 100)
+    limits = {"conservative": 25, "moderate": 45, "aggressive": 80}
+    vol_limit = limits.get(str(risk_tolerance).lower(), 45)
+    score, reasons, flags = 0.0, [], []
+    if last > sma20 > sma50:
+        score += 2; reasons.append("Tendência positiva: preço acima das médias de 20 e 50 períodos.")
+    elif last < sma20 < sma50:
+        score -= 2; reasons.append("Tendência negativa: preço abaixo das médias de 20 e 50 períodos.")
+    else:
+        reasons.append("Médias móveis sem alinhamento claro.")
+    if momentum > 3:
+        score += 1; reasons.append(f"Momentum de 20 períodos positivo ({momentum:.1f}%).")
+    elif momentum < -3:
+        score -= 1; reasons.append(f"Momentum de 20 períodos negativo ({momentum:.1f}%).")
+    if rsi < 30:
+        score += .5; reasons.append("RSI abaixo de 30: possível sobrevenda, sem garantia de reversão.")
+    elif rsi > 70:
+        score -= .5; reasons.append("RSI acima de 70: possível sobrecompra, risco de correção.")
+    if vol > vol_limit:
+        score *= .5; flags.append(f"Volatilidade estimada ({vol:.1f}%) acima do limite ({vol_limit}%).")
+    if max_dd <= -25:
+        flags.append(f"Drawdown histórico elevado ({max_dd:.1f}%).")
+    if len(returns) < 100:
+        flags.append("Amostra limitada; validação fora da amostra recomendada.")
+    decision = "BUY" if score >= 2 else "SELL" if score <= -2 else "HOLD"
+    confidence = min(.95, .5 + abs(score) * .10)
+    if vol > vol_limit:
+        confidence = min(confidence, .55)
+    return {"ticker": None, "decision": decision, "score": round(score, 3),
+            "confidence": round(confidence, 3), "last_price": last, "rsi": round(rsi, 2),
+            "sma20": round(sma20, 4), "sma50": round(sma50, 4),
+            "momentum_20d_pct": round(momentum, 2),
+            "annualized_volatility_pct": round(vol, 2), "max_drawdown_pct": round(max_dd, 2),
+            "reasons": reasons, "risk_flags": flags,
+            "disclaimer": "Sinal quantitativo experimental; não é recomendação financeira nem previsão garantida."}
+
+def position_size(capital, risk_fraction, entry_price, stop_price, max_exposure_fraction=.20):
+    values = [capital, risk_fraction, entry_price, stop_price, max_exposure_fraction]
+    if any(not math.isfinite(float(v)) for v in values):
+        raise ValueError("Todos os parâmetros devem ser números finitos.")
+    if capital < 0 or not 0 < risk_fraction <= .05:
+        raise ValueError("Capital não negativo e risco por operação entre 0 e 5%.")
+    if entry_price <= 0 or stop_price <= 0 or stop_price >= entry_price:
+        raise ValueError("Para posição comprada, stop deve ficar abaixo da entrada.")
+    if not 0 < max_exposure_fraction <= 1:
+        raise ValueError("Exposição máxima deve estar entre 0 e 100%.")
+    by_risk = capital * risk_fraction / (entry_price - stop_price)
+    by_exposure = capital * max_exposure_fraction / entry_price
+    return max(0.0, min(by_risk, by_exposure))
